@@ -100,18 +100,18 @@ def main():
     data_indep = pd.read_pickle(os.path.join(data_folder, 'indep_ar_process.pkl'))
     data_corr = pd.read_pickle(os.path.join(data_folder, 'corr_ar_process.pkl'))
 
-    choice = 'arima'
+    choice = 'ets'
 
     # Independent data
-    base_fc_indep = fit_model(data_indep, choice=choice)
-    test_data_indep = get_test_dict(data_indep)
+    base_fc_indep = fit_model(data_indep, choice=choice, step=1)
+    test_data_indep = get_test_dict(data_indep,step=1)
 
     safe_pickle(base_fc_indep, os.path.join(fc_folder, f'indep_base_fc_{choice}.pkl'))
     safe_pickle(test_data_indep, os.path.join(fc_folder, 'indep_test_dict.pkl'))
 
     # Correlated data
-    base_fc_corr = fit_model(data_corr, choice=choice)
-    test_data_corr = get_test_dict(data_corr)
+    base_fc_corr = fit_model(data_corr, choice=choice,step=1)
+    test_data_corr = get_test_dict(data_corr,step=1)
 
     safe_pickle(base_fc_corr, os.path.join(fc_folder, f'corr_base_fc_{choice}.pkl'))
     safe_pickle(test_data_corr, os.path.join(fc_folder, 'corr_test_dict.pkl'))
