@@ -114,7 +114,7 @@ def main():
     data_indep = pd.read_pickle(os.path.join(data_folder, 'indep_ar_process.pkl'))
     data_corr = pd.read_pickle(os.path.join(data_folder, 'corr_ar_process.pkl'))
 
-    choice = 'ets'
+    choice = 'arima'
 
     # Independent data
     base_fc_indep = fit_model(data_indep, choice=choice, step=1,n_samples=1000)

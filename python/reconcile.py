@@ -169,7 +169,25 @@ def main():
 
     f_quadratic = lambda B: B[:, 0]**2 + B[:, 1]**2
     ets_fc = pd.read_pickle(os.path.join(fc_folder, 'indep_base_fc_ets.pkl'))
-    reconciled_ets_fc = reconcile_rolling_forecasts_nonlinear(ets_fc, relation=f_quadratic)
+    reconciled_ets_fc = {}
+    for h in range(1, ets_fc['U'].shape[1] + 1):
+        print(f"\nReconciliating horizon h={h}")
+
+        sliced_dict = {
+            key: ets_fc[key][:, h - 1, :]  # shape: (691, 1000)
+            for key in ets_fc
+        }
+
+        df_dict = {
+            key: pd.DataFrame(sliced_dict[key])
+            for key in sliced_dict
+        }
+
+        reconciled = reconcile_rolling_forecasts_nonlinear(df_dict, relation=f_quadratic)
+
+        # Store the reconciled result by horizon
+        reconciled_ets_fc[f"h={h}"] = reconciled
+
     reconciled_ets_fc['U'].shape
 
 
