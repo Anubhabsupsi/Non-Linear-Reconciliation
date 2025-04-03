@@ -4,8 +4,16 @@ from statsforecast import StatsForecast
 from statsforecast.models import AutoARIMA
 from statsforecast.models import AutoETS
 from typing import Dict, Tuple
+import numpy as np
 
-def fit_model(data: pd.DataFrame, choice: str = 'arima', h: int = 10, window_size: int = 300, step: int = 10) -> Dict[str, pd.DataFrame]:
+def fit_model(
+    data: pd.DataFrame,
+    choice: str = 'arima',
+    h: int = 10,
+    window_size: int = 300,
+    step: int = 10,
+    n_samples: int = 100
+) -> Dict[str, np.ndarray]:
     dates = pd.date_range(start='2000-01-01', periods=len(data), freq='D')
     df_long = pd.concat([
         pd.DataFrame({
@@ -18,40 +26,46 @@ def fit_model(data: pd.DataFrame, choice: str = 'arima', h: int = 10, window_siz
 
     if choice == 'arima':
         model_cls = AutoARIMA
-        model_name = 'AutoARIMA'
+        model_col = 'AutoARIMA'
     elif choice == 'ets':
         model_cls = lambda: AutoETS(season_length=1)
-        model_name = 'AutoETS'
+        model_col = 'AutoETS'
     else:
         raise ValueError(f"Invalid choice: {choice}. Available choices are 'arima' and 'ets'.")
 
     forecast_dict = {}
 
     for uid in df_long['unique_id'].unique():
-        print(f"Fitting {model_name} for {uid}")
+        print(f"Fitting {choice.upper()} for {uid}")
         df_series = df_long[df_long['unique_id'] == uid].reset_index(drop=True)
-        rows_forecast = []
+        sample_list = []
 
         for start in range(0, len(df_series) - window_size - h + 1, step):
             train = df_series.iloc[start:start + window_size]
-            test_start = pd.to_datetime(df_series['ds'].iloc[start + window_size])
 
-            forecast = StatsForecast(models=[model_cls()], freq='D').forecast(
-                df=train[['unique_id', 'ds', 'y']], h=h
-            )
+            sf = StatsForecast(models=[model_cls()], freq='D')
+            fitted_model = sf.fit(train[['unique_id', 'ds', 'y']])
 
-            forecast['ds'] = pd.to_datetime(forecast['ds'])
-            forecast['horizon'] = (forecast['ds'] - test_start).dt.days + 1
-            forecast = forecast[(forecast['horizon'] >= 1) & (forecast['horizon'] <= h)]
+            # Forecast with fitted=True to allow residual extraction
+            fcst = fitted_model.forecast(df=train[['unique_id', 'ds', 'y']], h=h, fitted=True)
 
-            row = pd.Series(index=[f"h={i}" for i in range(1, h + 1)], dtype='float64')
-            row.update(
-                forecast.set_index(forecast['horizon'].map(lambda x: f"h={x}"))[model_name]
-            )
-            row.name = test_start
-            rows_forecast.append(row.to_frame().T)
+            # Extract residuals from fitted values
+            fitted_vals = fitted_model.forecast_fitted_values()
+            residuals = train['y'].values - fitted_vals[model_col].values
 
-        forecast_dict[uid] = pd.concat(rows_forecast)
+            # Point forecast for h horizons
+            forecast_vals = fcst[model_col].values[:h]
+
+            # Simulate forecast samples by adding bootstrapped residuals
+            samples = np.array([
+                forecast_vals + np.random.choice(residuals, size=h, replace=True)
+                for _ in range(n_samples)
+            ])  # shape: (n_samples, h)
+
+            sample_list.append(samples.T)  # shape: (h, n_samples)
+
+        # Final output shape: (n_forecasts, h, n_samples)
+        forecast_dict[uid] = np.stack(sample_list)
 
     return forecast_dict
 
@@ -103,14 +117,14 @@ def main():
     choice = 'ets'
 
     # Independent data
-    base_fc_indep = fit_model(data_indep, choice=choice, step=1)
+    base_fc_indep = fit_model(data_indep, choice=choice, step=1,n_samples=1000)
     test_data_indep = get_test_dict(data_indep,step=1)
 
     safe_pickle(base_fc_indep, os.path.join(fc_folder, f'indep_base_fc_{choice}.pkl'))
     safe_pickle(test_data_indep, os.path.join(fc_folder, 'indep_test_dict.pkl'))
 
     # Correlated data
-    base_fc_corr = fit_model(data_corr, choice=choice,step=1)
+    base_fc_corr = fit_model(data_corr, choice=choice,step=1,n_samples=1000)
     test_data_corr = get_test_dict(data_corr,step=1)
 
     safe_pickle(base_fc_corr, os.path.join(fc_folder, f'corr_base_fc_{choice}.pkl'))
