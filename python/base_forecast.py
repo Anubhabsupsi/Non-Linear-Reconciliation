@@ -1,109 +1,144 @@
-import pandas as pd
-import os
-from statsforecast import StatsForecast
-from statsforecast.models import AutoARIMA
-from statsforecast.models import AutoETS
-from typing import Dict, Tuple
 import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+import plotly.graph_objects as go
+import os
+import pickle
 
-def fit_model(
-    data: pd.DataFrame,
-    choice: str = 'arima',
-    h: int = 10,
-    window_size: int = 300,
-    step: int = 10,
-    n_samples: int = 100
-) -> Dict[str, np.ndarray]:
-    dates = pd.date_range(start='2000-01-01', periods=len(data), freq='D')
-    df_long = pd.concat([
-        pd.DataFrame({
-            'unique_id': name,
-            'ds': dates,
-            'y': data[name].values
-        })
-        for name in data.columns
-    ])
+def fit_predictive_model(data_indep, tr_ratio=0.8, plot_steps=10, n_estimators=100, criterion='absolute_error', n_samples=100):
+    """
+    Fits a predictive model using RandomForestRegressor (L1 loss) to forecast B1, B2, U
+    based on lag-1 value, and visualizes predictions + predictive samples.
 
-    if choice == 'arima':
-        model_cls = AutoARIMA
-        model_col = 'AutoARIMA'
-    elif choice == 'ets':
-        model_cls = lambda: AutoETS(season_length=1)
-        model_col = 'AutoETS'
-    else:
-        raise ValueError(f"Invalid choice: {choice}. Available choices are 'arima' and 'ets'.")
+    Parameters:
+    -----------
+    data_indep : pd.DataFrame
+        DataFrame with columns ['B1', 'B2', 'U'] (or more), indexed by time.
+    tr_ratio : float
+        Proportion of data to use for training (default 0.8).
+    plot_steps : int
+        Number of steps to plot in the prediction sample plot (default 10).
+    n_estimators : int
+        Number of estimators for RandomForest (default 100).
+    criterion : str
+        Loss function for RandomForest (default 'absolute_error').
+    n_samples : int
+        Desired number of predictive samples per step.
 
-    forecast_dict = {}
+    Returns:
+    --------
+    y_hat_te_samples : np.ndarray
+        Predictive samples tensor: shape (test_steps, n_samples, n_vars).
+    y_hat_te : pd.DataFrame
+        Point forecasts on test set.
+    top_errors : pd.DataFrame
+        Top 20% smallest L2-norm training residuals used for resampling.
+    df_te : pd.DataFrame
+        Test portion of the original input data.
+    """
+    from sklearn.ensemble import RandomForestRegressor
+    import matplotlib.pyplot as plt
+    import plotly.graph_objects as go
+    import numpy as np
+    import pandas as pd
 
-    for uid in df_long['unique_id'].unique():
-        print(f"Fitting {choice.upper()} for {uid}")
-        df_series = df_long[df_long['unique_id'] == uid].reset_index(drop=True)
-        sample_list = []
+    df_tr = data_indep.iloc[:int(tr_ratio * len(data_indep))]
+    df_te = data_indep.iloc[int(tr_ratio * len(data_indep)):]
 
-        for start in range(0, len(df_series) - window_size - h + 1, step):
-            train = df_series.iloc[start:start + window_size]
+    # Initialize predictions
+    y_hat_te = pd.DataFrame(index=df_te.index[:-1], columns=df_te.columns)
+    y_hat_tr = pd.DataFrame(index=df_tr.index[:-1], columns=df_tr.columns)
 
-            sf = StatsForecast(models=[model_cls()], freq='D')
-            fitted_model = sf.fit(train[['unique_id', 'ds', 'y']])
+    # Fit + predict for each column independently
+    for col in df_tr.columns:
+        model = RandomForestRegressor(n_estimators=n_estimators, criterion=criterion)
+        model.fit(df_tr.iloc[:-1][[col]], df_tr.iloc[1:][col])
+        y_hat_te[col] = model.predict(df_te.iloc[:-1][[col]])
+        y_hat_tr[col] = model.predict(df_tr.iloc[:-1][[col]])
 
-            # Forecast with fitted=True to allow residual extraction
-            fcst = fitted_model.forecast(df=train[['unique_id', 'ds', 'y']], h=h, fitted=True)
+    # Plot predictions vs. ground truth
 
-            # Extract residuals from fitted values
-            fitted_vals = fitted_model.forecast_fitted_values()
-            residuals = train['y'].values - fitted_vals[model_col].values
+    # Create plot
+    fig, ax = plt.subplots(figsize=(10, 5))
 
-            # Point forecast for h horizons
-            forecast_vals = fcst[model_col].values[:h]
+    # Automatically assign consistent colors
+    colors = plt.get_cmap("tab10")
 
-            # Simulate forecast samples by adding bootstrapped residuals
-            samples = np.array([
-                forecast_vals + np.random.choice(residuals, size=h, replace=True)
-                for _ in range(n_samples)
-            ])  # shape: (n_samples, h)
+    for i, col in enumerate(df_tr.columns):
+        color = colors(i)
 
-            sample_list.append(samples.T)  # shape: (h, n_samples)
+        # Ground truth: solid line
+        ax.plot(df_te.index[:-1], df_te.iloc[:-1][col],
+                label=f'{col} (Ground Truth)', color=color, linestyle='-')
 
-        # Final output shape: (n_forecasts, h, n_samples)
-        forecast_dict[uid] = np.stack(sample_list)
+        # Prediction: dashed line with same color
+        ax.plot(df_te.index[:-1], y_hat_te[col],
+                label=f'{col} (Prediction)', color=color, linestyle='--')
 
-    return forecast_dict
+    ax.set_title('Predictions vs. Ground Truth')
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+    # Compute training errors
+    tr_errors = df_tr.iloc[1:] - y_hat_tr
+    tr_errors.dropna(inplace=True)
 
+    # Take 20% smallest errors (based on L2 norm)
+    error_magnitudes = (tr_errors ** 2).sum(axis=1)
+    top_errors = tr_errors.loc[error_magnitudes.nsmallest(int(len(error_magnitudes) * 0.2)).index]
 
-def get_test_dict(data: pd.DataFrame, h: int = 10, window_size: int = 300, step: int = 10) -> Dict[str, pd.DataFrame]:
-    dates = pd.date_range(start='2000-01-01', periods=len(data), freq='D')
-    df_long = pd.concat([
-        pd.DataFrame({
-            'unique_id': name,
-            'ds': dates,
-            'y': data[name].values
-        })
-        for name in data.columns
-    ])
+    # Resample to match n_samples
+    resampled_errors = top_errors.sample(n=n_samples, replace=True).values
 
-    test_dict = {}
+    # Predictive samples tensor: shape (T_test, n_samples, D)
+    y_hat_te_samples = y_hat_te.values[:, np.newaxis, :] + resampled_errors[np.newaxis, :, :]
 
-    for uid in df_long['unique_id'].unique():
-        df_series = df_long[df_long['unique_id'] == uid].reset_index(drop=True)
-        rows_truth = []
+    # Plot predictive samples (first N steps)
+    fig, ax = plt.subplots(figsize=(18, 8))
+    plt.plot(df_te.iloc[:plot_steps].values, color='green', label='ground truth')
+    plt.plot(y_hat_te.iloc[:plot_steps].values, color='red', label='prediction')
+    xs = np.tile(np.arange(plot_steps), (y_hat_te_samples[:plot_steps, :, 0].shape[1], 1))
+    for i in range(data_indep.shape[1]):  # Loop over variables
+        plt.scatter(xs, np.squeeze(y_hat_te_samples[:plot_steps, :, i].T), alpha=0.6,
+                    label=f'samples {data_indep.columns[i]}')
+    plt.legend()
+    plt.title('Predictive Samples (First Steps)')
+    plt.show()
 
-        for start in range(0, len(df_series) - window_size - h + 1, step):
-            test_start = pd.to_datetime(df_series['ds'].iloc[start + window_size])
-            actual_values = df_series['y'].iloc[start + window_size : start + window_size + h].values
-            actual_row = pd.Series(actual_values, index=[f"h={i}" for i in range(1, h + 1)], dtype='float64')
-            actual_row.name = test_start
-            rows_truth.append(actual_row.to_frame().T)
+    # 3D plot using plotly (first 20 steps)
+    fig = go.Figure()
+    fig.update_layout(width=1000, height=800, title='3D Predictive Samples')
+    for i in range(min(20, len(y_hat_te_samples))):
+        fig.add_trace(
+            go.Scatter3d(x=y_hat_te_samples[i, :, 0], y=y_hat_te_samples[i, :, 1], z=y_hat_te_samples[i, :, 2],
+                         mode='markers', marker=dict(size=3, color='blue', opacity=0.6)))
+        fig.add_trace(go.Scatter3d(x=[y_hat_te.iloc[i, 0]], y=[y_hat_te.iloc[i, 1]], z=[y_hat_te.iloc[i, 2]],
+                                   mode='markers', marker=dict(size=6, color='red')))
+        fig.add_trace(go.Scatter3d(x=[df_te.iloc[i, 0]], y=[df_te.iloc[i, 1]], z=[df_te.iloc[i, 2]],
+                                   mode='markers', marker=dict(size=6, color='green')))
 
-        test_dict[uid] = pd.concat(rows_truth)
+    # Plot paraboloid surface
+    x = np.linspace(-0.6, 0.6, 100)
+    y = np.linspace(-0.6, 0.6, 100)
+    X, Y = np.meshgrid(x, y)
+    Z = X ** 2 + Y ** 2
+    fig.add_trace(go.Surface(x=X, y=Y, z=Z, opacity=0.3, colorscale='Blues'))
+    fig.show()
 
-    return test_dict
+    # Distribution plots of B1, B2, U in training set
+    fig, ax = plt.subplots(1, 3, figsize=(18, 4))
+    df_tr.plot.hist(ax=ax[0], bins=100, alpha=0.5)
+    df_tr['B1'].plot.kde(ax=ax[0], color='red')
+    df_tr['B2'].plot.kde(ax=ax[1], color='red')
+    df_tr['U'].plot.kde(ax=ax[2], color='red')
+    ax[0].set_title('B1 Distribution')
+    ax[1].set_title('B2 Distribution')
+    ax[2].set_title('U Distribution')
+    plt.show()
 
-def safe_pickle(obj, path: str):
-    if not os.path.exists(path):
-        pd.to_pickle(obj, path)
-        print(f"✅ Saved: {path}")
-    else:
-        print(f"⚠️ Skipped (already exists): {path}")
+    return y_hat_te_samples, y_hat_te, top_errors, df_te
+
 
 def main():
     data_folder = '../data/'
@@ -114,22 +149,37 @@ def main():
     data_indep = pd.read_pickle(os.path.join(data_folder, 'indep_ar_process.pkl'))
     data_corr = pd.read_pickle(os.path.join(data_folder, 'corr_ar_process.pkl'))
 
-    choice = 'arima'
-
     # Independent data
-    base_fc_indep = fit_model(data_indep, choice=choice, step=1,n_samples=1000)
-    test_data_indep = get_test_dict(data_indep,step=1)
-
-    safe_pickle(base_fc_indep, os.path.join(fc_folder, f'indep_base_fc_{choice}.pkl'))
-    safe_pickle(test_data_indep, os.path.join(fc_folder, 'indep_test_dict.pkl'))
+    n_samples = 500
+    base_fc_indep, indep_det_fc, indep_tr_errors, df_te = fit_predictive_model(data_indep,n_samples=n_samples)
+    save_path = os.path.join(fc_folder, f'base_fc_indep_{n_samples}.pkl')
+    with open(save_path, 'wb') as f:
+        pickle.dump(base_fc_indep, f)
+    res_path = os.path.join(fc_folder, f'res_indep_{n_samples}.pkl')
+    with open(res_path, 'wb') as f:
+        pickle.dump(indep_tr_errors, f)
+    det_path = os.path.join(fc_folder, f'det_fc_indep_{n_samples}.pkl')
+    with open(det_path, 'wb') as f:
+        pickle.dump(indep_det_fc, f)
+    df_path = os.path.join(fc_folder, f'indep_te_{n_samples}.pkl')
+    with open(df_path, 'wb') as f:
+        pickle.dump(df_te, f)
 
     # Correlated data
-    base_fc_corr = fit_model(data_corr, choice=choice,step=1,n_samples=1000)
-    test_data_corr = get_test_dict(data_corr,step=1)
+    base_fc_corr, corr_det_fc, corr_tr_errors, df_corr_te = fit_predictive_model(data_corr,n_samples=n_samples)
+    save_path = os.path.join(fc_folder, f'base_fc_corr_{n_samples}.pkl')
+    with open(save_path, 'wb') as f:
+        pickle.dump(base_fc_corr, f)
+    res_path = os.path.join(fc_folder, f'res_corr_{n_samples}.pkl')
+    with open(res_path, 'wb') as f:
+        pickle.dump(corr_tr_errors, f)
+    det_path = os.path.join(fc_folder, f'det_fc_corr_{n_samples}.pkl')
+    with open(det_path, 'wb') as f:
+        pickle.dump(corr_det_fc, f)
+    df_path = os.path.join(fc_folder, f'corr_te_{n_samples}.pkl')
+    with open(df_path, 'wb') as f:
+        pickle.dump(df_corr_te, f)
 
-    safe_pickle(base_fc_corr, os.path.join(fc_folder, f'corr_base_fc_{choice}.pkl'))
-    safe_pickle(test_data_corr, os.path.join(fc_folder, 'corr_test_dict.pkl'))
 
-
-if __name__ in '__main__':
+if __name__ == '__main__':
     main()
