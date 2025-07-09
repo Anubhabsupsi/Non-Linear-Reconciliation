@@ -1,0 +1,10 @@
+{
+  "query": [
+    { "code": "Jahr", "selection": { "filter": "all", "values": ["*"] }},
+    { "code": "Kanton", "selection": { "filter": "all", "values": ["*"] }},
+    { "code": "Staatsangehörigkeit (Kategorie)", "selection": { "filter": "all", "values": ["*"] }},
+    { "code": "Geschlecht", "selection": { "filter": "all", "values": ["*"] }},
+    { "code": "Demografische Komponente", "selection": { "filter": "item", "values": ["2", "14"] }}
+  ],
+  "response": { "format": "json-stat2" }
+}
