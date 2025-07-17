@@ -4,5 +4,5 @@ Nonlinear forecast reconciliation becomes necessary when the relationships among
 
 In this study, we focus on nonlinear reconciliation, in which the time series are linked by a nonlinear function f. We assume f to be known. We propose four probabilistic methods for nonlinear forecast reconciliation, which extend the existing linear reconciliation methods for the nonlinear case.
 
-
+## Simulation
 

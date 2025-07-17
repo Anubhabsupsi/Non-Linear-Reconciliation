@@ -1,96 +1,144 @@
+import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from pathlib import Path
+import pickle
+import warnings
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from concurrent.futures import ProcessPoolExecutor
+import os
+import argparse
 
-# Load data
-DATA_PATH = Path("../data/mortality_CH.csv")
-df = pd.read_csv(DATA_PATH)
+warnings.filterwarnings("ignore")
 
-# Normalize columns
-df["Region"] = df["Region"].str.strip().str.capitalize()
-df["citizenship"] = df["citizenship"].str.capitalize()
-df["Sex"] = df["Sex"].str.capitalize()
-df["series"] = df["series"].str.lower()
-df["Year"] = pd.to_numeric(df["Year"], errors="coerce")
 
-# Targets
-target_regions = ["Switzerland", "Zürich", "Genève", "Ticino"]
-target_series = ["death", "population", "mortality_rate"]
+def fit_and_forecast(group_df: pd.DataFrame, uid: tuple, target: str, n_samples: int) -> pd.DataFrame:
+    group_df = group_df.sort_values("Year").drop_duplicates(subset="Year")
+    ts = group_df.set_index("Year")[target].astype(float).sort_index()
 
-# Output dir
-output_dir = Path("../figures")
-output_dir.mkdir(parents=True, exist_ok=True)
+    results = []
+    max_test_year = ts.index.max()
+    max_train_end = max_test_year - 1
 
-sns.set(style="whitegrid")
+    for start_year in range(ts.index.min(), max_train_end - 29 + 1):
+        train = ts.loc[start_year: start_year + 29]
+        if len(train) < 30 or train.isnull().any():
+            continue
 
-### 1. By Region only (all regions)
-for series in target_series:
-    target_regions = ["Switzerland", "Zürich", "Genève", "Ticino"]
-    plt.figure(figsize=(12, 8))
-    subset = df[(df["series"] == series) & (df["Region"].isin(target_regions))]
-    sns.lineplot(data=subset, x="Year", y="value", hue="Region", errorbar=None, marker="o")
-    plt.title(f"{series.capitalize()} by Region (All)")
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{series}_all_regions.png")
-    plt.close()
+        try:
+            model = ExponentialSmoothing(train, trend="add", seasonal=None)
+            fitted = model.fit()
+            fitted_vals = fitted.fittedvalues
+            residuals = train.values - fitted_vals
 
-### 2. By Gender only (aggregated over all regions)
-for series in target_series:
-    subset = df[df["series"] == series].groupby(["Year", "Sex", "series"], as_index=False)["value"].sum()
-    plt.figure(figsize=(10, 5))
-    sns.lineplot(data=subset, x="Year", y="value", hue="Sex", marker="o",errorbar=None)
-    plt.title(f"{series.capitalize()} by Gender (All Regions)")
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{series}_all_by_gender.png")
-    plt.close()
+            samples = np.array([
+                fitted.forecast(1).values + np.random.normal(0, residuals.std(), size=1)
+                for _ in range(n_samples)
+            ]).flatten()
 
-### 3. By Citizenship only
-for series in target_series:
-    subset = df[df["series"] == series].groupby(["Year", "citizenship", "series"], as_index=False)["value"].sum()
-    plt.figure(figsize=(10, 5))
-    sns.lineplot(data=subset, x="Year", y="value", hue="citizenship", marker="o",errorbar=None)
-    plt.title(f"{series.capitalize()} by Citizenship (All Regions)")
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{series}_all_by_citizenship.png")
-    plt.close()
+            results.append({
+                "uid": uid,
+                "target": target,
+                "train_start": train.index.min(),
+                "train_end": train.index.max(),
+                "test_year": train.index.max() + 1,
+                "forecast_samples": samples,
+                "residuals": residuals
+            })
 
-### 4. Region + Gender
-for region in target_regions:
-    for series in target_series:
-        subset = df[(df["Region"] == region) & (df["series"] == series)]
-        plt.figure(figsize=(10, 5))
-        sns.lineplot(data=subset, x="Year", y="value", hue="Sex", marker="o",errorbar=None)
-        plt.title(f"{series.capitalize()} in {region} by Gender")
-        plt.tight_layout()
-        plt.savefig(output_dir / f"{series}_{region}_by_gender.png")
-        plt.close()
+        except Exception as e:
+            print(f"⚠️ Failed for {uid}, {start_year}: {e}")
+            results.append({
+                "uid": uid,
+                "target": target,
+                "train_start": train.index.min(),
+                "train_end": train.index.max(),
+                "test_year": train.index.max() + 1,
+                "forecast_samples": np.full(n_samples, np.nan),
+                "residuals": np.full(30, np.nan)
+            })
 
-### 5. Region + Citizenship
-for region in target_regions:
-    for series in target_series:
-        subset = df[(df["Region"] == region) & (df["series"] == series)]
-        plt.figure(figsize=(10, 5))
-        sns.lineplot(data=subset, x="Year", y="value", hue="citizenship", marker="o",errorbar=None)
-        plt.title(f"{series.capitalize()} in {region} by Citizenship")
-        plt.tight_layout()
-        plt.savefig(output_dir / f"{series}_{region}_by_citizenship.png")
-        plt.close()
+    return pd.DataFrame(results)
 
-### 6. Region + Gender + Citizenship
-for region in target_regions:
-    for series in target_series:
-        subset = df[(df["Region"] == region) & (df["series"] == series)]
-        g = sns.FacetGrid(
-            subset,
-            col="Sex",
-            row="citizenship",
-            margin_titles=True,
-            height=3.5,
-            aspect=1.6,
-        )
-        g.map(sns.lineplot, "Year", "value", marker="o", color="steelblue",errorbar=None)
-        g.fig.subplots_adjust(top=0.9)
-        g.fig.suptitle(f"{series.capitalize()} in {region} by Gender & Citizenship")
-        g.savefig(output_dir / f"{series}_{region}_by_gender_citizenship.png")
-        plt.close()
+
+def force_tuple(x):
+    if isinstance(x, tuple):
+        return x
+    if isinstance(x, str):
+        try:
+            return eval(x)
+        except Exception:
+            return None
+    return None
+
+
+def process_group(args):
+    group_df, uid, target, n_samples = args
+    group_df = group_df[group_df["gender"] == uid[1]]
+    return fit_and_forecast(group_df, uid, target, n_samples)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n_samples", type=int, default=1000)
+    parser.add_argument("--output", type=str, default="../forecasts/forecast_bottom_samples.pkl")
+    args = parser.parse_args()
+
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+
+    df = pd.read_csv("../data/mortality_complete_data.csv")
+    df = df[df["age_group"] == "Total"]
+    df = df[df["citizenship"] == "Total"]
+    df["deaths"] = pd.to_numeric(df["deaths"], errors="coerce")
+    df["population"] = pd.to_numeric(df["population"], errors="coerce")
+    df = df.drop(columns=["age_group", "citizenship"])
+
+    output = {}
+    for target in ["deaths", "population"]:
+        print(f"🔹 Target: {target}")
+        grouped = df.groupby(["Region", "gender"])
+        results = []
+
+        with ProcessPoolExecutor() as executor:
+            futures = [
+                executor.submit(process_group, (group.copy(), uid, target, args.n_samples))
+                for uid, group in grouped
+                if group["Year"].nunique() >= 30
+            ]
+            for future in futures:
+                result = future.result()
+                if not result.empty:
+                    results.append(result)
+
+        combined_df = pd.concat(results, ignore_index=True)
+        combined_df["uid"] = combined_df["uid"].apply(force_tuple)
+        combined_df = combined_df[combined_df["uid"].notnull()]
+
+        uids = sorted(combined_df["uid"].unique(), key=lambda x: (x[0], x[1]))
+        years = sorted(combined_df["test_year"].unique())
+        uid_to_idx = {uid: i for i, uid in enumerate(uids)}
+        year_to_idx = {year: i for i, year in enumerate(years)}
+
+        samples_arr = np.full((len(uids), len(years), args.n_samples), np.nan)
+        residuals_arr = np.full((len(uids), len(years), 30), np.nan)
+
+        for (_, row) in combined_df.iterrows():
+            uid, year = row["uid"], row["test_year"]
+            if uid in uid_to_idx and year in year_to_idx:
+                i, j = uid_to_idx[uid], year_to_idx[year]
+                samples_arr[i, j, :] = row["forecast_samples"]
+                residuals_arr[i, j, :] = row["residuals"]
+
+        output[target] = {
+            "uids": uids,
+            "years": years,
+            "samples": samples_arr,
+            "residuals": residuals_arr,
+        }
+
+    with open(args.output, "wb") as f:
+        pickle.dump(output, f)
+
+    print(f"✅ Saved forecast samples and residuals to {args.output}")
+
+
+if __name__ == "__main__":
+    main()

@@ -4,7 +4,8 @@
     { "code": "Kanton", "selection": { "filter": "all", "values": ["*"] }},
     { "code": "Staatsangehörigkeit (Kategorie)", "selection": { "filter": "all", "values": ["*"] }},
     { "code": "Geschlecht", "selection": { "filter": "all", "values": ["*"] }},
-    { "code": "Demografische Komponente", "selection": { "filter": "item", "values": ["2", "14"] }}
+    { "code": "Alter", "selection": { "filter": "item", "values": [] }},
+    { "code": "Demografische Komponente", "selection": { "filter": "item", "values": [] }}
   ],
   "response": { "format": "json-stat2" }
 }

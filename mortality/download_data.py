@@ -1,100 +1,224 @@
 import requests
-import pandas as pd
 import json
+import time
+import pandas as pd
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import partial
+import os
 from pyjstat import pyjstat
-from pathlib import Path
 
-API_URL = "https://www.pxweb.bfs.admin.ch/api/v1/en/px-x-0102020000_101/px-x-0102020000_101.px"
-QUERY_FILE = "query.json"
-OUTPUT_DIR = Path("../data")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+API_URL = "https://www.pxweb.bfs.admin.ch/api/v1/en/px-x-0102020000_104/px-x-0102020000_104.px"
+AGE_CODES = [str(i) for i in range(0, 101)]
+BATCH_SIZE = 2
+QUERY_PATH = "query.json"
+SLEEP = 1  # seconds
+MAX_WORKERS =  max(1, os.cpu_count() - 1) # Adjust based on your system and BFS limits
 
-def clean_and_rename(df, component_name):
-    # Standardize canton name
+def load_query():
+    with open(QUERY_PATH, "r") as f:
+        return json.load(f)
+
+def fetch(component_code, ages, query_base):
+    q = json.loads(json.dumps(query_base))  # deep copy
+    for dim in q["query"]:
+        if dim["code"] == "Alter":
+            dim["selection"]["values"] = ages
+        elif dim["code"] == "Demografische Komponente":
+            dim["selection"]["values"] = [component_code]
+
+    try:
+        r = requests.post(API_URL, json=q, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            tqdm.write(f"❌ HTTP {r.status_code} for ages {ages} and component {component_code}")
+            return None
+        df = pyjstat.from_json_stat(r.json())[0]
+        df["component"] = "deaths" if component_code == "2" else "population"
+        return df
+    except Exception as e:
+        tqdm.write(f"❌ JSON parsing error for ages {ages} and component {component_code}: {e}")
+        return None
+
+def clean_and_rename(df):
+    print("🧼 Cleaning and standardizing column names...")
+
+    # Clean canton name
     df["Region"] = df["Canton"].str.split("/").str[0].str.strip()
     df.drop(columns=["Canton"], inplace=True)
 
     # Rename columns
     df.rename(columns={
-        "Citizenship (category)": "citizenship",
-        "value": component_name.lower()
+        "Sex": "gender",
+        "Citizenship (category)": "citizenship"
     }, inplace=True)
 
-    # Drop 'Demographic component'
-    df.drop(columns=["Demographic component"], inplace=True)
+    # Drop unused column
+    df = df.drop(columns=["Demographic component"], errors="ignore")
 
-    # Safely remove 'No indication' if its value is zero
+    # Remove 'No indication' if total is zero
     if "No indication" in df["Region"].values:
-        col = component_name.lower()
-        total = df[df["Region"] == "No indication"][col].sum()
+        total = df.loc[df["Region"] == "No indication", "value"].sum()
         if total == 0:
-            print(f"Dropped 'No indication' from {component_name.lower()} (zero total).")
             df = df[df["Region"] != "No indication"]
-        else:
-            print(f"WARNING: 'No indication' in {component_name.lower()} has non-zero total ({total}) — not dropped.")
+
+    # Filter out existing totals from BFS
+    df = df[df["gender"] != "Sex - total"]
+    df = df[df["citizenship"] != "Citizenship (category) - total"]
+    df = df[df["Age"] != "Age - total"]
 
     return df
 
 
+
+def group_ages(df):
+    print("------------------------------------------------------------------")
+    print("📊 Grouping ages into 5-year bins, with '75+' as the top group...")
+    print("------------------------------------------------------------------")
+
+    def map_age(age_str):
+        if age_str == "Total":
+            return "Total"
+        if age_str == "99 years or older":
+            return "75+"
+        try:
+            age = int(age_str.split()[0])
+            if age >= 75:
+                return "75+"
+            lower = (age // 5) * 5
+            upper = lower + 4
+            return f"{lower}–{upper}"
+        except Exception:
+            return "unknown"
+
+    df["age_group"] = df["Age"].apply(map_age)
+    return df
+
+def add_gender_totals(df):
+    print("➕ Adding 'Total' gender rows...")
+    base_df = df[df["gender"] != "Total"]
+    grouped = base_df.groupby(
+        ["Year", "Region", "citizenship", "age_group", "component"], as_index=False
+    )["value"].sum()
+    grouped["gender"] = "Total"
+    return pd.concat([df, grouped], ignore_index=True)
+
+
+def add_national_total(df):
+    print("🇨🇭 Adding Switzerland-wide totals...")
+    base_df = df[df["Region"] != "Switzerland"]
+    national = base_df.groupby(
+        ["Year", "citizenship", "gender", "age_group", "component"], as_index=False
+    )["value"].sum()
+    national["Region"] = "Switzerland"
+    return pd.concat([df, national], ignore_index=True)
+
+
+def add_age_totals(df):
+    print("➕ Adding 'Total' age group rows...")
+    base_df = df[df["age_group"] != "Total"]
+    grouped = base_df.groupby(
+        ["Year", "Region", "citizenship", "gender", "component"], as_index=False
+    )["value"].sum()
+    grouped["age_group"] = "Total"
+    return pd.concat([df, grouped], ignore_index=True)
+
+def add_citizenship_totals(df):
+    print("➕ Adding 'Total' citizenship rows...")
+    base_df = df[df["citizenship"] != "Total"]
+    grouped = base_df.groupby(
+        ["Year", "Region", "gender", "age_group", "component"], as_index=False
+    )["value"].sum()
+    grouped["citizenship"] = "Total"
+    return pd.concat([df, grouped], ignore_index=True)
+
+
+def compute_mortality_rate(df):
+    print("------------------------------------------------------------------")
+    print("📈 Computing mortality rates by age group...")
+    print("------------------------------------------------------------------")
+
+    df_wide = df.pivot_table(
+        index=["Year", "Region", "citizenship", "gender", "age_group"],
+        columns="component",
+        values="value",
+        aggfunc="sum"
+    ).reset_index()
+
+    if "deaths" not in df_wide.columns or "population" not in df_wide.columns:
+        raise ValueError("❌ Missing required columns to compute mortality rate.")
+
+    df_wide["mortality_rate"] = df_wide["deaths"] / df_wide["population"]
+    return df_wide
+
 def main():
-    # Load query
-    with open(QUERY_FILE, "r", encoding="utf-8") as f:
-        query = json.load(f)
+    raw_path = "../data/mortality_raw_data.csv"
+    output_path = "../data/mortality_complete_data.csv"
 
-    # Send request
-    response = requests.post(API_URL, json=query)
-    print("CONGRATULATIONS!🥳 You have successfully downloaded the data. Status:", response.status_code)
-    if response.status_code != 200:
-        print("OOPS!😔 Error:", response.text)
-        return
+    # Skip download if raw file exists
+    if os.path.exists(raw_path):
+        print(f"📂 Raw file already exists at {raw_path}, skipping download...")
+        final = pd.read_csv(raw_path)
+    else:
+        print("📥 Starting download from BFS API...")
+        print("------------------------------------------------------------")
+        print("Huge dataset, might take a while...")
+        print("------------------------------------------------------------")
 
-    df = pyjstat.from_json_stat(response.json())[0]
+        query_base = load_query()
+        fetch_partial = partial(fetch, query_base=query_base)
+        age_batches = [AGE_CODES[i:i + BATCH_SIZE] for i in range(0, len(AGE_CODES), BATCH_SIZE)]
+        jobs = [(comp, ages) for comp in ["2", "14"] for ages in age_batches]
 
-    # Split by demographic component
-    deaths = df[df["Demographic component"] == "Death"].copy()
-    pop = df[df["Demographic component"] == "Population on 31 December"].copy()
+        all_dfs = []
+        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+            futures = {executor.submit(fetch_partial, comp, ages): (comp, ages)
+                       for comp, ages in jobs}
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Downloading data"):
+                try:
+                    df = future.result()
+                    if df is not None:
+                        all_dfs.append(df)
+                except Exception as e:
+                    tqdm.write(f"❌ Future failed with exception: {e}")
 
-    # Clean + rename
-    deaths = clean_and_rename(deaths, component_name="Death")
-    pop = clean_and_rename(pop, component_name="Population")
+        print("✅ Success 🥳: Downloaded data")
 
-    # Save deaths and population
-    deaths.to_csv(OUTPUT_DIR / "deaths_CH.csv", index=False)
-    pop.to_csv(OUTPUT_DIR / "population_CH.csv", index=False)
-    print(f"Saved {deaths.shape[0]} death records")
-    print(f"Saved {pop.shape[0]} population records")
+        print("📚 Combining all data chunks...")
+        final = pd.concat(all_dfs, ignore_index=True)
 
-    # Merge and compute mortality rate
-    merged = pd.merge(
-        deaths,
-        pop,
-        on=["Year", "Region", "Sex", "citizenship"],
-        how="inner"
-    )
-    # Merge and compute mortality rate
-    merged = pd.merge(
-        deaths,
-        pop,
-        on=["Year", "Region", "Sex", "citizenship"],
-        how="inner"
-    )
-    merged["mortality_rate"] = merged["death"] / merged["population"]
+        print(f"💾 Saving raw data to {raw_path}")
+        final.to_csv(raw_path, index=False)
 
-    # Build long format
-    long_df = pd.concat([
-        deaths.rename(columns={"death": "value"}).assign(series="death"),
-        pop.rename(columns={"population": "value"}).assign(series="population"),
-        merged[["Year", "Region", "Sex", "citizenship", "mortality_rate"]]
-            .rename(columns={"mortality_rate": "value"})
-            .assign(series="mortality_rate")
-    ], ignore_index=True)
+    print("🧹 Cleaning data...")
+    cleaned = clean_and_rename(final)
 
-    # Reorder columns
-    long_df = long_df[["Year", "Region", "Sex", "citizenship", "series", "value"]]
+    print("📦 Grouping into age bins...")
+    grouped = group_ages(cleaned)
+    grouped = grouped.drop(columns=["Age"])
 
-    # Save to single file
-    long_df.to_csv(OUTPUT_DIR / "mortality_CH.csv", index=False)
-    print(f"Saved unified long-format dataset with {long_df.shape[0]} rows")
+    # 🧹 Remove all pre-aggregated totals
+    grouped = grouped[
+        (grouped["age_group"] != "Total") &
+        (grouped["gender"] != "Total") &
+        (grouped["Region"] != "Switzerland")
+        ]
+
+    # ✅ Add custom totals in correct order
+    grouped = add_gender_totals(grouped)
+    grouped = add_national_total(grouped)
+    grouped = add_age_totals(grouped)
+    grouped = add_citizenship_totals(grouped)
+
+    print("⚙️ Calculating mortality rate...")
+    mortality_data = compute_mortality_rate(grouped)
+    print(mortality_data[(mortality_data['Region'] == 'Switzerland') &
+                         (mortality_data['gender'] == 'Total') &
+                         (mortality_data['age_group'] == 'Total') &
+                         (mortality_data['citizenship'] == 'Total')].iloc[-1])
+
+    print(f"💾 Saving processed data to {output_path}")
+    mortality_data.to_csv(output_path, index=False)
+    print("✅ Done! Data saved.")
 
 if __name__ == "__main__":
     main()
