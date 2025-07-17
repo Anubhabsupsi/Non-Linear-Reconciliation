@@ -72,7 +72,7 @@ truth_after = truth_series[truth_series.index >= first_forecast_year]
 # -----------------------------
 # 📊 Plotting
 # -----------------------------
-fig, ax = plt.subplots(figsize=(10, 6))
+fig, ax = plt.subplots(figsize=(14, 8))
 
 ax.plot(truth_before.index, truth_before.values, label="Ground Truth (Train)", marker="o", color="black")
 ax.plot(truth_after.index, truth_after.values, label="Ground Truth (Test)", marker="o", linestyle="--", color="gray")
